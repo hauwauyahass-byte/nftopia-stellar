@@ -79,6 +79,7 @@ const initialState: AuthStore = {
   initializeAuth: async () => {},
   loginWithWallet: async () => {},
   logout: async () => {},
+  refreshSession: async () => false,
   setShowExpiryWarning: () => {},
   setWarningThreshold: () => {},
   setLockTimeout: () => {},
@@ -95,6 +96,11 @@ const initialState: AuthStore = {
   goBack: () => {},
   resetToScreen: () => {},
 };
+
+let refreshPromise: Promise<boolean> | null = null;
+let sessionGeneration = 0;
+let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+const REFRESH_BUFFER_SECONDS = 120;
 
 export const useAuthStore = createStore<AuthStore>({
   name: 'auth-store',
@@ -131,8 +137,7 @@ export const useAuthStore = createStore<AuthStore>({
           const refreshToken = await tokenStorage.getRefreshToken();
           if (refreshToken) {
             try {
-              await walletAuthService.refreshAccessToken();
-              sessionValid = true;
+              sessionValid = await get().refreshSession();
             } catch {
               sessionValid = false;
             }
@@ -175,9 +180,14 @@ export const useAuthStore = createStore<AuthStore>({
 
     // Full challenge -> sign -> verify wallet login, replacing any prior session.
     loginWithWallet: async (wallet: Wallet) => {
+      sessionGeneration++;
+      clearTimeout(refreshTimer);
       set({ loading: true, error: null });
       try {
         const authResponse = await walletAuthService.walletLogin(wallet);
+        if (authResponse?.access_token && authResponse?.refresh_token) {
+          await tokenStorage.saveTokens(authResponse.access_token, authResponse.refresh_token);
+        }
         const expiry = await tokenStorage.getTokenExpiryTime();
         set({
           user: {
@@ -189,7 +199,6 @@ export const useAuthStore = createStore<AuthStore>({
           wallet,
           isAuthenticated: true,
           isCreator: false,
-          loading: false,
           lastLogin: new Date().toISOString(),
           sessionExpiryTime: expiry,
           isLocked: false,
@@ -199,15 +208,19 @@ export const useAuthStore = createStore<AuthStore>({
       } catch (error) {
         set({
           error: error instanceof Error ? error.message : 'Failed to sign in with wallet',
-          loading: false,
+          isAuthenticated: false,
         });
         // Re-throw so the calling screen (which owns its own submit/loading
         // UI) knows not to proceed past the login step.
         throw error;
+      } finally {
+        set({ loading: false });
       }
     },
 
     logout: async () => {
+      sessionGeneration++;
+      clearTimeout(refreshTimer);
       try {
         set({ loading: true });
         // The auth session (tokens) and the wallet *connection* are
@@ -244,22 +257,31 @@ export const useAuthStore = createStore<AuthStore>({
     setLockTimeout: (seconds: number) => set({ lockTimeout: seconds }),
     setAppLockEnabled: (enabled: boolean) => set({ appLockEnabled: enabled }),
 
-    // Exchanges the refresh token for a new access/refresh pair and moves
-    // the session expiry out accordingly. Never throws — a failure here
-    // means the refresh token itself is no longer valid, which callers
-    // (SessionExpiryModal, the polling check in useAuth) treat as "fall
-    // back to login" by calling `logout()` themselves on a `false` return.
-    extendSession: async (): Promise<boolean> => {
-      try {
-        await walletAuthService.refreshAccessToken();
-        const expiry = await tokenStorage.getTokenExpiryTime();
-        set({ sessionExpiryTime: expiry, showExpiryWarning: false });
-        return true;
-      } catch (error) {
-        set({ error: error instanceof Error ? error.message : 'Failed to extend session' });
-        return false;
-      }
+    // Every automatic/manual refresh shares the same rotation request.
+    refreshSession: () => {
+      if (refreshPromise) return refreshPromise;
+      const generation = sessionGeneration;
+      refreshPromise = (async () => {
+        try {
+          await walletAuthService.refreshAccessToken(() => generation === sessionGeneration);
+          if (generation !== sessionGeneration) return false;
+          const expiry = await tokenStorage.getTokenExpiryTime();
+          set({ sessionExpiryTime: expiry, showExpiryWarning: false, error: null });
+          return true;
+        } catch {
+          if (generation === sessionGeneration) {
+            await get().logout();
+            set({ error: 'Your session could not be refreshed. Please sign in again.' });
+          }
+          return false;
+        } finally {
+          refreshPromise = null;
+        }
+      })();
+      return refreshPromise;
     },
+
+    extendSession: () => get().refreshSession(),
 
     getSessionTimeRemaining: (): number | null => {
       const { sessionExpiryTime } = get();
@@ -364,4 +386,15 @@ export const useAuthStore = createStore<AuthStore>({
     enabled: __DEV__,
     name: 'AuthStore',
   },
+});
+
+// One timer per store, independent of how many screens use the auth hook.
+useAuthStore.subscribe((state, previous) => {
+  if (state.isAuthenticated === previous.isAuthenticated &&
+      state.sessionExpiryTime === previous.sessionExpiryTime) return;
+  clearTimeout(refreshTimer);
+  if (!state.isAuthenticated || state.sessionExpiryTime === null) return;
+  const delay = Math.max(1000, (state.sessionExpiryTime - REFRESH_BUFFER_SECONDS) * 1000 - Date.now());
+  refreshTimer = setTimeout(() => { void useAuthStore.getState().refreshSession(); },
+    Math.min(delay, 2_147_483_647));
 });

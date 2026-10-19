@@ -68,6 +68,7 @@ jest.mock('@/stores/walletStore', () => ({
 import { Keypair } from 'stellar-sdk';
 import { useAuthStore } from '../authStore';
 import { walletAuthService } from '@/src/services/auth/walletAuth.service';
+import { tokenStorage } from '@/src/services/auth/tokenStorage';
 import { AuthResponse } from '@/src/services/auth/types';
 import { Wallet } from '@/src/services/stellar/types';
 
@@ -99,6 +100,7 @@ function getStore() {
 describe('useAuthStore (top-level)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    require('@/src/services/auth/tokenStorage').tokenStorage.clearSessionCache();
     useAuthStore.setState({
       user: null,
       wallet: null,
@@ -169,6 +171,21 @@ describe('useAuthStore (top-level)', () => {
       expect(error).toBeNull();
     });
 
+    it('persists tokens via tokenStorage on successful login', async () => {
+      const wallet = makeWallet();
+      const authResponse = makeAuthResponse(wallet);
+      mockWalletAuthService.walletLogin.mockResolvedValue(authResponse);
+      const saveTokensSpy = jest.spyOn(tokenStorage, 'saveTokens');
+
+      await getStore().loginWithWallet(wallet);
+
+      expect(saveTokensSpy).toHaveBeenCalledWith(
+        authResponse.access_token,
+        authResponse.refresh_token,
+      );
+      saveTokensSpy.mockRestore();
+    });
+
     it('sets error, leaves isAuthenticated false, and rethrows when WalletAuthService rejects', async () => {
       const wallet = makeWallet();
       mockWalletAuthService.walletLogin.mockRejectedValue(new Error('Invalid wallet signature'));
@@ -181,6 +198,17 @@ describe('useAuthStore (top-level)', () => {
       expect(isAuthenticated).toBe(false);
       expect(error).toBe('Invalid wallet signature');
       expect(loading).toBe(false);
+    });
+
+    it('guarantees loading is reset to false in finally block on failure', async () => {
+      const wallet = makeWallet();
+      mockWalletAuthService.walletLogin.mockRejectedValue(new Error('Network failure'));
+
+      await expect(getStore().loginWithWallet(wallet)).rejects.toThrow('Network failure');
+
+      expect(getStore().loading).toBe(false);
+      expect(getStore().isAuthenticated).toBe(false);
+      expect(getStore().error).toBe('Network failure');
     });
   });
 
@@ -356,7 +384,7 @@ describe('useAuthStore (top-level)', () => {
       const result = await getStore().extendSession();
 
       expect(result).toBe(false);
-      expect(getStore().error).toBe('refresh token invalid');
+      expect(getStore().error).toContain('Please sign in again');
     });
   });
 
@@ -433,5 +461,76 @@ describe('useAuthStore (top-level)', () => {
       expect(getStore().failedUnlockAttempts).toBe(0);
       expect(getStore().lockoutUntil).toBeNull();
     });
+  });
+});
+
+
+describe('refreshSession lifecycle', () => {
+  const { tokenStorage } = require('@/src/services/auth/tokenStorage');
+  beforeEach(async () => {
+    await getStore().logout();
+    jest.clearAllMocks();
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-10-15T12:00:00Z'));
+  });
+  afterEach(async () => {
+    await getStore().logout();
+    jest.useRealTimers();
+  });
+  const startSession = async () => {
+    const exp = Date.now() / 1000 + 600;
+    const jwt = `header.${Buffer.from(JSON.stringify({ exp })).toString('base64url')}.sig`;
+    await tokenStorage.saveTokens(jwt, 'refresh-old');
+    useAuthStore.setState({ isAuthenticated: true, sessionExpiryTime: exp });
+  };
+  it('refreshes two minutes before expiry and schedules the rotated token', async () => {
+    await startSession();
+    mockWalletAuthService.refreshAccessToken.mockImplementation(async () => {
+      const exp = Date.now() / 1000 + 600;
+      await tokenStorage.saveTokens(`h.${Buffer.from(JSON.stringify({ exp })).toString('base64url')}.s`, 'rotated');
+      return makeAuthResponse(makeWallet());
+    });
+    await jest.advanceTimersByTimeAsync(479000);
+    expect(mockWalletAuthService.refreshAccessToken).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(1000);
+    expect(mockWalletAuthService.refreshAccessToken).toHaveBeenCalledTimes(1);
+    expect(getStore().isAuthenticated).toBe(true);
+    expect(getStore().sessionExpiryTime).toBe(Date.now() / 1000 + 600);
+    await jest.advanceTimersByTimeAsync(480000);
+    expect(mockWalletAuthService.refreshAccessToken).toHaveBeenCalledTimes(2);
+  });
+  it('shares one exchange across simultaneous callers', async () => {
+    await startSession();
+    mockWalletAuthService.refreshAccessToken.mockResolvedValue(makeAuthResponse(makeWallet()));
+    expect(await Promise.all([getStore().refreshSession(), getStore().extendSession(), getStore().refreshSession()])).toEqual([true, true, true]);
+    expect(mockWalletAuthService.refreshAccessToken).toHaveBeenCalledTimes(1);
+  });
+  it('clears tokens, wallet connection and auth state with a reason on failure', async () => {
+    await startSession();
+    mockWalletAuthService.refreshAccessToken.mockRejectedValue(new Error('revoked'));
+    expect(await getStore().refreshSession()).toBe(false);
+    expect(getStore().isAuthenticated).toBe(false);
+    expect(getStore().sessionExpiryTime).toBeNull();
+    expect(getStore().error).toContain('Please sign in again');
+    expect(await tokenStorage.getAccessToken()).toBeNull();
+    expect(await tokenStorage.getRefreshToken()).toBeNull();
+    expect(mockDisconnectWallet).toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(600000);
+    expect(mockWalletAuthService.refreshAccessToken).toHaveBeenCalledTimes(1);
+  });
+  it('invalidates a pending refresh on logout and cancels the timer', async () => {
+    await startSession();
+    let finish!: () => void;
+    mockWalletAuthService.refreshAccessToken.mockImplementation((isCurrent) => new Promise((resolve, reject) => {
+      finish = () => isCurrent!() ? resolve(makeAuthResponse(makeWallet())) : reject(new Error('Session ended'));
+    }));
+    const pending = getStore().refreshSession();
+    await getStore().logout();
+    finish();
+    expect(await pending).toBe(false);
+    expect(getStore().isAuthenticated).toBe(false);
+    expect(getStore().error).toBeNull();
+    await jest.advanceTimersByTimeAsync(600000);
+    expect(mockWalletAuthService.refreshAccessToken).toHaveBeenCalledTimes(1);
   });
 });

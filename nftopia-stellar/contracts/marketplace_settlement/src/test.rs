@@ -5,7 +5,8 @@ use crate::{
     error::{SettlementError, SwapTimeoutError},
     royalty_distributor::RoyaltyDistributor,
     settlement_core::{MarketplaceSettlement, MarketplaceSettlementClient},
-    types::{Asset, AuctionType, FeeConfig, SwapTimeoutConfig, TokenAsset},
+    storage::auction_store::{AuctionStore, MAX_BIDS_PER_AUCTION},
+    types::{Asset, AuctionType, Bid, FeeConfig, SwapTimeoutConfig, TokenAsset},
     utils::time_utils,
 };
 use soroban_sdk::{
@@ -125,6 +126,37 @@ fn reg(env: &Env, cid: &Address, nft: &Address, creator: &Address, admin: &Addre
     env.as_contract(cid, || {
         let _ = RoyaltyDistributor::set_royalty_info(env, nft, 1, creator, 500, creator);
     });
+}
+
+// ─── Allowlist views ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_is_nft_allowed_view_tracks_allowlist() {
+    let (env, cid, client, admin) = new_env();
+    let nft = Address::generate(&env);
+    assert!(!client.is_nft_allowed(&nft));
+    reg(
+        &env,
+        &cid,
+        &nft,
+        &Address::generate(&env),
+        &admin,
+        &mk_asset(&env),
+    );
+    assert!(client.is_nft_allowed(&nft));
+    client.remove_allowed_nft_contract(&admin, &nft);
+    assert!(!client.is_nft_allowed(&nft));
+}
+
+#[test]
+fn test_is_token_allowed_view_tracks_allowlist() {
+    let (env, _cid, client, admin) = new_env();
+    let token = Address::generate(&env);
+    assert!(!client.is_token_allowed(&token));
+    client.add_allowed_token_contract(&admin, &token);
+    assert!(client.is_token_allowed(&token));
+    client.remove_allowed_token_contract(&admin, &token);
+    assert!(!client.is_token_allowed(&token));
 }
 
 // ─── Init ────────────────────────────────────────────────────────────────────
@@ -328,6 +360,72 @@ fn test_bid_below_starting_price_fails() {
     assert!(client
         .try_place_bid(&id, &bidder, &50_000i128, &None)
         .is_err());
+}
+
+#[test]
+fn test_zero_and_dust_bids_fail_for_english_and_dutch_auctions() {
+    let (env, cid, client, admin) = new_env();
+    let asset = mk_asset(&env);
+    let seller = Address::generate(&env);
+    let bidder = Address::generate(&env);
+    let creator = Address::generate(&env);
+
+    for auction_type in [AuctionType::English, AuctionType::Dutch] {
+        let nft = env.register(MockNft, ());
+        reg(&env, &cid, &nft, &creator, &admin, &asset);
+        MockNftClient::new(&env, &nft).set_owner(&seller);
+        let id = client.create_auction(
+            &seller,
+            &nft,
+            &1u64,
+            &100_000i128,
+            &0i128,
+            &3600u64,
+            &1_000i128,
+            &auction_type,
+            &asset,
+        );
+
+        assert!(client.try_place_bid(&id, &bidder, &0i128, &None).is_err());
+        assert!(client.try_place_bid(&id, &bidder, &1i128, &None).is_err());
+        assert_eq!(client.get_auction(&id).highest_bid, 0i128);
+    }
+}
+
+#[test]
+fn test_auction_bid_history_is_capped() {
+    let (env, cid, _client, _admin) = new_env();
+    env.as_contract(&cid, || {
+        for _ in 0..MAX_BIDS_PER_AUCTION {
+            AuctionStore::add_bid(
+                &env,
+                1,
+                &Bid {
+                    bidder: Address::generate(&env),
+                    amount: 100_000,
+                    placed_at: 0,
+                    is_committed: false,
+                    commitment_hash: None,
+                    refunded: false,
+                },
+            )
+            .unwrap();
+        }
+
+        let result = AuctionStore::add_bid(
+            &env,
+            1,
+            &Bid {
+                bidder: Address::generate(&env),
+                amount: 100_000,
+                placed_at: 0,
+                is_committed: false,
+                commitment_hash: None,
+                refunded: false,
+            },
+        );
+        assert_eq!(result, Err(SettlementError::InvalidState));
+    });
 }
 
 #[test]

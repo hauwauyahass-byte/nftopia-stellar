@@ -3,6 +3,7 @@ import { NavLink, Outlet } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useAuth } from '../auth/useAuth'
 import { LocaleSwitcher } from './LocaleSwitcher'
+import { canManageDlq } from '../dlq/access'
 
 // ---------------------------------------------------------------------------
 // Icon components (inline SVG, no external icon lib required)
@@ -69,6 +70,44 @@ function SettingsIcon() {
   )
 }
 
+function FlagIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      className="h-4 w-4 shrink-0"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.75}
+      viewBox="0 0 24 24"
+    >
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M4.5 3.75v16.5m0 0h15M4.5 4.5h11.25l-1.5 3.75 1.5 3.75H4.5"
+      />
+    </svg>
+  )
+}
+
+function RetryIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      className="h-4 w-4 shrink-0"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.75}
+      viewBox="0 0 24 24"
+    >
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M16.023 9.348h4.992V4.356M2.985 19.644v-4.992h4.992m0 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182"
+      />
+    </svg>
+  )
+}
+
 function MenuIcon() {
   return (
     <svg
@@ -118,6 +157,25 @@ function UserCircleIcon() {
   )
 }
 
+function UsersIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      className="h-4 w-4 shrink-0"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.75}
+      viewBox="0 0 24 24"
+    >
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M15 19.128a9.38 9.38 0 002.625.372 9.337 9.337 0 004.121-.952 4.125 4.125 0 00-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 018.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0111.964-3.07M12 6.375a3.375 3.375 0 11-6.75 0 3.375 3.375 0 016.75 0zm8.25 2.25a2.625 2.625 0 11-5.25 0 2.625 2.625 0 015.25 0z"
+      />
+    </svg>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Nav items driven by i18n keys
 // ---------------------------------------------------------------------------
@@ -126,11 +184,16 @@ interface NavItem {
   to: string
   labelKey: string
   icon: ReactNode
+  /** Hides the item unless the signed-in role passes this check. */
+  visibleTo?: (role: string | undefined) => boolean
 }
 
 const NAV_ITEMS: NavItem[] = [
   { to: '/dashboard', labelKey: 'nav.dashboard', icon: <DashboardIcon /> },
+  { to: '/users', labelKey: 'nav.users', icon: <UsersIcon /> },
   { to: '/collections', labelKey: 'nav.collections', icon: <CollectionsIcon /> },
+  { to: '/content-flags', labelKey: 'nav.contentFlags', icon: <FlagIcon /> },
+  { to: '/transaction-retry', labelKey: 'nav.transactionRetry', icon: <RetryIcon />, visibleTo: canManageDlq },
   { to: '/settings', labelKey: 'nav.settings', icon: <SettingsIcon /> },
 ]
 
@@ -144,6 +207,9 @@ interface SidebarContentProps {
 
 function SidebarContent({ onNavClick }: SidebarContentProps) {
   const { t } = useTranslation()
+  const { state } = useAuth()
+  const role = state.status === 'authenticated' ? state.user.role : undefined
+  const items = NAV_ITEMS.filter((item) => !item.visibleTo || item.visibleTo(role))
 
   const navLinkClass = ({ isActive }: { isActive: boolean }) =>
     [
@@ -168,7 +234,7 @@ function SidebarContent({ onNavClick }: SidebarContentProps) {
       {/* Navigation */}
       <nav aria-label="Main navigation" className="flex-1 overflow-y-auto px-2 py-3">
         <ul className="flex flex-col gap-0.5">
-          {NAV_ITEMS.map(({ to, labelKey, icon }) => (
+          {items.map(({ to, labelKey, icon }) => (
             <li key={to}>
               <NavLink to={to} className={navLinkClass} onClick={onNavClick}>
                 {icon}
